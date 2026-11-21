@@ -31,8 +31,9 @@ namespace {
 
 // Verified MHW:I 15.23 (Steam 15539686, ImageBase 0x140000000) RVAs & Offsets:
 constexpr std::uint32_t  kRvaThkUpdateRandom     = 0x1339C8CU; // `cThinkMgr::updateThk` `CALL MtRandom::nrand`
-constexpr std::uintptr_t kRvaCallerAiTick        = 0x133B6F0U; // `FUN_14133b640(cThinkEm*)`
-constexpr std::uintptr_t kRvaCallerPrefetchTick  = 0x133A876U; // `FUN_14133a850(cThinkMgr*)`
+constexpr std::uintptr_t kRvaCallerEmAiTick      = 0x132B83DU; // `cThinkEm::update` @ 0x14132B7B0 (PRIMARY large monster AI tick)
+constexpr std::uintptr_t kRvaCallerAiTick        = 0x133B6F0U; // `FUN_14133b640(cThinkEm*)` (secondary AI tick)
+constexpr std::uintptr_t kRvaCallerPrefetchTick  = 0x133A876U; // `FUN_14133a850(cThinkMgr*)` (prefetch AI tick)
 constexpr std::uintptr_t kRvaCThinkMgrVft        = 0x324F438U; // `cThinkMgr::vft`
 constexpr std::uintptr_t kRvaCThinkEmVft         = 0x324F320U; // `cThinkEm::vft`
 
@@ -83,16 +84,27 @@ struct SegmentOption {
     std::int32_t targetNodeId;
 };
 
+enum class ReadFailReason : std::uint8_t {
+    kNone          = 0,
+    kBadCaller     = 1,
+    kBadMgrVft     = 2,
+    kBadMonsterPtr = 3,
+    kBadDepthOrNode = 4,
+    kBadCandidates = 5
+};
+
 struct LiveThkContext {
-    bool          isValid         = false;
-    bool          isFatalis       = false;
-    std::uint32_t depth           = 0U;
-    std::int32_t  thkFileIdx      = -1;
-    std::int32_t  nodeArrIdx      = -1;
-    std::int32_t  callerNodeIdx   = -1;
-    std::size_t   candCount       = 0U;
-    float         totalWeight     = 0.0f;
-    SegmentOption cands[kMaxThkCandidates]{};
+    bool           isValid           = false;
+    bool           isFatalis         = false;
+    ReadFailReason failReason        = ReadFailReason::kNone;
+    std::uint32_t  observedCallerRva = 0U;
+    std::uint32_t  depth             = 0U;
+    std::int32_t   thkFileIdx        = -1;
+    std::int32_t   nodeArrIdx        = -1;
+    std::int32_t   callerNodeIdx     = -1;
+    std::size_t    candCount         = 0U;
+    float          totalWeight       = 0.0f;
+    SegmentOption  cands[kMaxThkCandidates]{};
 };
 
 struct FatalisHistoryEntry {
@@ -108,6 +120,20 @@ struct FatalisHistoryEntry {
     char          moveTag[40]{};
 };
 
+struct DiagSnapshot {
+    std::uint64_t enabledCalls      = 0ULL;
+    std::uint64_t badCallerCount    = 0ULL;
+    std::uint64_t badVftOrPtrCount  = 0ULL;
+    std::uint64_t nonFatalisCount   = 0ULL;
+    std::uint64_t fatalisUnmatched  = 0ULL;
+    std::uint32_t lastBadCallerRva  = 0U;
+    std::uint32_t lastUnmatchDepth  = 0U;
+    std::int32_t  lastUnmatchFile   = -1;
+    std::int32_t  lastUnmatchNode   = -1;
+    std::int32_t  lastUnmatchSeg0   = -1;
+    std::int32_t  lastUnmatchCaller = -1;
+};
+
 constexpr std::size_t kHistoryCap = 8U;
 
 const MhwRngHostApi* g_host   = nullptr;
@@ -121,6 +147,7 @@ bool                 g_farMultiFireball = false; // false = 55:179 (单发火球
 std::uint64_t        g_controlledRolls  = 0ULL;
 FatalisHistoryEntry  g_history[kHistoryCap]{};
 std::size_t          g_historyCount     = 0U;
+DiagSnapshot         g_diag{};
 
 // ============================================================================
 //  Helpers & Math
@@ -162,28 +189,40 @@ void CopyTrunc(char* dst, std::size_t cap, const char* src) noexcept {
 // ============================================================================
 
 bool ReadLiveThkContextSEH(const MhwRngDrawContext* ctx, LiveThkContext& out) noexcept {
-    if (!ctx || !ctx->returnAddrSlot || !ctx->exeBase) return false;
+    if (!ctx || !ctx->returnAddrSlot || !ctx->exeBase) {
+        out.failReason = ReadFailReason::kBadCaller;
+        return false;
+    }
     __try {
         const auto* slotPtr = static_cast<const std::uintptr_t*>(ctx->returnAddrSlot);
         const std::uintptr_t callerRet = slotPtr[20];
+        if (callerRet >= ctx->exeBase && callerRet < ctx->exeEnd) {
+            out.observedCallerRva = static_cast<std::uint32_t>(callerRet - ctx->exeBase);
+        }
 
         std::uintptr_t mgr     = 0U;
         std::uintptr_t thinkEm = 0U;
         std::uintptr_t monster = 0U;
 
-        if (callerRet == (ctx->exeBase + kRvaCallerAiTick)) {
-            thinkEm = slotPtr[19];
+        if (callerRet == (ctx->exeBase + kRvaCallerEmAiTick)) {
+            thinkEm = slotPtr[23]; // `updateThk` saved caller `RSI` (`MOV [RSP+0xB0], RSI`)
             mgr     = thinkEm + kOffThinkEmToMgr;
-            monster = slotPtr[21];
+            monster = slotPtr[19]; // `updateThk` pushed caller `RDI` (`PUSH RDI`)
+        } else if (callerRet == (ctx->exeBase + kRvaCallerAiTick)) {
+            thinkEm = slotPtr[19]; // caller `RDI`
+            mgr     = thinkEm + kOffThinkEmToMgr;
+            monster = slotPtr[21]; // caller `RBX`
         } else if (callerRet == (ctx->exeBase + kRvaCallerPrefetchTick)) {
-            mgr     = slotPtr[21];
+            mgr     = slotPtr[21]; // caller `RBX`
             thinkEm = (mgr >= kOffThinkEmToMgr) ? (mgr - kOffThinkEmToMgr) : 0U;
         } else {
+            out.failReason = ReadFailReason::kBadCaller;
             return false;
         }
 
-        if (!IsValidUserPtr(mgr)) return false;
-        if (*reinterpret_cast<const std::uintptr_t*>(mgr) != (ctx->exeBase + kRvaCThinkMgrVft)) {
+        if (!IsValidUserPtr(mgr) ||
+            *reinterpret_cast<const std::uintptr_t*>(mgr) != (ctx->exeBase + kRvaCThinkMgrVft)) {
+            out.failReason = ReadFailReason::kBadMgrVft;
             return false;
         }
 
@@ -194,19 +233,28 @@ bool ReadLiveThkContextSEH(const MhwRngDrawContext* ctx, LiveThkContext& out) no
             *reinterpret_cast<const std::uintptr_t*>(thinkEm) == (ctx->exeBase + kRvaCThinkEmVft)) {
             monster = *reinterpret_cast<const std::uintptr_t*>(thinkEm + kOffThinkEmMonster);
         }
-        if (!IsValidUserPtr(monster)) return false;
+        if (!IsValidUserPtr(monster)) {
+            out.failReason = ReadFailReason::kBadMonsterPtr;
+            return false;
+        }
 
         out.isValid   = true;
         out.isFatalis = (*reinterpret_cast<const std::uint32_t*>(monster + kOffMonsterId) == kMonsterIdFatalis);
         if (!out.isFatalis) return true;
 
         const std::uint32_t depth = *reinterpret_cast<const std::uint32_t*>(mgr + kOffMgrDepth);
-        if (depth > 1U) return false;
+        if (depth > 1U) {
+            out.failReason = ReadFailReason::kBadDepthOrNode;
+            return false;
+        }
         out.depth = depth;
 
         const std::uintptr_t frameBase = mgr + static_cast<std::uintptr_t>(depth) * kOffMgrFrameBase;
         const std::uintptr_t nodeBase  = *reinterpret_cast<const std::uintptr_t*>(frameBase + kOffMgrNodeBase);
-        if (!IsValidUserPtr(nodeBase)) return false;
+        if (!IsValidUserPtr(nodeBase)) {
+            out.failReason = ReadFailReason::kBadDepthOrNode;
+            return false;
+        }
 
         out.thkFileIdx = *reinterpret_cast<const std::int32_t*>(frameBase + kOffMgrThkFileIdx);
         if (depth == 1U) {
@@ -222,7 +270,10 @@ bool ReadLiveThkContextSEH(const MhwRngDrawContext* ctx, LiveThkContext& out) no
                 break;
             }
         }
-        if (resolvedArrIdx < 0) return false;
+        if (resolvedArrIdx < 0) {
+            out.failReason = ReadFailReason::kBadDepthOrNode;
+            return false;
+        }
         out.nodeArrIdx = resolvedArrIdx;
 
         // Read populated candidate table at `mgr + 0x40` (`Candidate[30]`)
@@ -234,7 +285,10 @@ bool ReadLiveThkContextSEH(const MhwRngDrawContext* ctx, LiveThkContext& out) no
                 break;
             }
             const float w = cands[i].weight;
-            if (!std::isfinite(w) || w < 0.0f) return false;
+            if (!std::isfinite(w) || w < 0.0f) {
+                out.failReason = ReadFailReason::kBadCandidates;
+                return false;
+            }
 
             const std::uintptr_t seg = nodeBase + static_cast<std::uintptr_t>(cands[i].segIdx) * kThkSegStride;
             SegmentOption& dst = out.cands[n++];
@@ -246,11 +300,15 @@ bool ReadLiveThkContextSEH(const MhwRngDrawContext* ctx, LiveThkContext& out) no
             sumW += w;
         }
 
-        if (n == 0U || !(sumW > 0.0f)) return false;
+        if (n == 0U || !(sumW > 0.0f)) {
+            out.failReason = ReadFailReason::kBadCandidates;
+            return false;
+        }
         out.candCount   = n;
         out.totalWeight = sumW;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out.failReason = ReadFailReason::kBadMgrVft;
         return false;
     }
 }
@@ -504,9 +562,22 @@ void __fastcall OnThkRandomDraw(const MhwRngDrawContext* ctx,
     }
 
     LiveThkContext lc{};
-    if (!ReadLiveThkContextSEH(ctx, lc) || !lc.isValid || !lc.isFatalis) {
+    const bool readOk = ReadLiveThkContextSEH(ctx, lc);
+    if (!readOk || !lc.isValid || !lc.isFatalis) {
         ioDecision->action = kMhwRngActionUseCondition;
         ioDecision->condId = 0U;
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        ++g_diag.enabledCalls;
+        if (!readOk) {
+            if (lc.failReason == ReadFailReason::kBadCaller) {
+                ++g_diag.badCallerCount;
+                g_diag.lastBadCallerRva = lc.observedCallerRva;
+            } else {
+                ++g_diag.badVftOrPtrCount;
+            }
+        } else if (lc.isValid && !lc.isFatalis) {
+            ++g_diag.nonFatalisCount;
+        }
         return;
     }
 
@@ -514,6 +585,14 @@ void __fastcall OnThkRandomDraw(const MhwRngDrawContext* ctx,
     if (!m.matched) {
         ioDecision->action = kMhwRngActionUseCondition;
         ioDecision->condId = 0U;
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        ++g_diag.enabledCalls;
+        ++g_diag.fatalisUnmatched;
+        g_diag.lastUnmatchDepth  = lc.depth;
+        g_diag.lastUnmatchFile   = lc.thkFileIdx;
+        g_diag.lastUnmatchNode   = lc.nodeArrIdx;
+        g_diag.lastUnmatchSeg0   = (lc.candCount > 0U) ? lc.cands[0].segIdx : -1;
+        g_diag.lastUnmatchCaller = lc.callerNodeIdx;
         return;
     }
 
@@ -523,6 +602,7 @@ void __fastcall OnThkRandomDraw(const MhwRngDrawContext* ctx,
     ioDecision->value0 = solvedU32;
 
     std::lock_guard<std::mutex> lk(g_stateMx);
+    ++g_diag.enabledCalls;
     ++g_controlledRolls;
     for (std::size_t i = kHistoryCap - 1U; i > 0U; --i) {
         g_history[i] = g_history[i - 1U];
@@ -594,9 +674,33 @@ bool __fastcall FormatFatalisSlotStatus(const MhwRngSlotSnapshot* snap,
     }
 }
 
+void PrintFatalisDiag() {
+    DiagSnapshot ds{};
+    std::uint64_t rolls = 0ULL;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        ds    = g_diag;
+        rolls = g_controlledRolls;
+    }
+    g_host->ChatPrintf(u8"[fatalis] 诊断: 回调=%llu 命中=%llu 非黑龙=%llu 未知caller=%llu(0x%X) 指针/表异常=%llu",
+                       static_cast<unsigned long long>(ds.enabledCalls),
+                       static_cast<unsigned long long>(rolls),
+                       static_cast<unsigned long long>(ds.nonFatalisCount),
+                       static_cast<unsigned long long>(ds.badCallerCount),
+                       ds.lastBadCallerRva,
+                       static_cast<unsigned long long>(ds.badVftOrPtrCount));
+    if (ds.fatalisUnmatched > 0ULL) {
+        g_host->ChatPrintf(u8"[fatalis] 黑龙未命中(P2/P3/四足/非P1节点)=%llu次, 最近一次(d=%u file=%d node=%d seg0=%d caller=%d)",
+                           static_cast<unsigned long long>(ds.fatalisUnmatched),
+                           ds.lastUnmatchDepth, ds.lastUnmatchFile,
+                           ds.lastUnmatchNode, ds.lastUnmatchSeg0, ds.lastUnmatchCaller);
+    }
+}
+
 void PrintFatalisStatus() {
     bool en = false, guards = true, farMulti = false;
     std::uint64_t rolls = 0ULL;
+    std::uint64_t calls = 0ULL;
     FatalisHistoryEntry latest{};
     {
         std::lock_guard<std::mutex> lk(g_stateMx);
@@ -604,6 +708,7 @@ void PrintFatalisStatus() {
         guards   = g_guardsEnabled;
         farMulti = g_farMultiFireball;
         rolls    = g_controlledRolls;
+        calls    = g_diag.enabledCalls;
         if (g_historyCount > 0U) latest = g_history[0];
     }
 
@@ -612,13 +717,16 @@ void PrintFatalisStatus() {
                        farMulti ? u8"三连火球(55:220)" : u8"单发火球(55:179)",
                        guards ? u8"开(14/15/18/46/129~133)" : u8"关(仅75~79+55[87])",
                        static_cast<unsigned long long>(rolls));
+    if (en && rolls == 0ULL && calls > 0ULL) {
+        PrintFatalisDiag();
+    }
     if (latest.valid) {
         g_host->ChatPrintf(u8"[fatalis] 最近一次: [%s] -> %s (node=%d seg=%d w=%.0f/%.0f u32=0x%08X)",
                            latest.bandTag, latest.moveTag,
                            latest.nodeArrIdx, latest.chosenSegIdx,
                            latest.chosenWeight, latest.totalWeight, latest.injectedU32);
     } else {
-        g_host->ChatPrint(u8"[fatalis] 用法: `$rng fatalis on|off|status|history|far single|multi|guards on|off`");
+        g_host->ChatPrint(u8"[fatalis] 用法: `$rng fatalis on|off|status|history|diag|far single|multi|guards on|off`");
     }
 }
 
@@ -659,8 +767,12 @@ void __fastcall Cmd_Fatalis(int argc, const char* const* argv, const char*, void
         PrintFatalisHistory();
         return;
     }
+    if (a0 == "diag" || a0 == "debug") {
+        PrintFatalisDiag();
+        return;
+    }
     if (a0 == "help" || a0 == "?") {
-        g_host->ChatPrint(u8"[fatalis] 开关: `$rng fatalis on` | `off` | `status` | `history`");
+        g_host->ChatPrint(u8"[fatalis] 开关: `$rng fatalis on` | `off` | `status` | `history` | `diag`");
         g_host->ChatPrint(u8"[fatalis] >4500火球: `$rng fatalis far single`(55:179) | `far multi`(55:220)");
         g_host->ChatPrint(u8"[fatalis] P1守卫: `$rng fatalis guards on|off` (禁额外车/保持二足/起身回弹/遮挡P1)");
         return;
@@ -743,7 +855,7 @@ const MhwRngPluginDescriptor kPluginDesc = {
     kMhwRngApiVersion,
     "fatalis",
     u8"黑龙一阶段二足纯RNG出招控制插件",
-    "1.0.0",
+    "1.0.1",
     u8"仅通过mhw_rng抽签回调控制黑龙(MonsterID=101)一阶段二足全距离段出招"
 };
 
@@ -769,7 +881,7 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
 
     host->RegisterSubcommand(selfId,
                              "fatalis",
-                             "$rng fatalis on|off|status|history|far single|multi|guards on|off",
+                             "$rng fatalis on|off|status|history|diag|far single|multi|guards on|off",
                              u8"黑龙(em013)一阶段二足纯RNG实时控招",
                              &Cmd_Fatalis,
                              nullptr);
@@ -783,6 +895,7 @@ MHW_RNG_PLUGIN_EXPORT void MhwRngPlugin_Shutdown() {
     g_farMultiFireball = false;
     g_controlledRolls  = 0ULL;
     g_historyCount     = 0U;
+    g_diag             = DiagSnapshot{};
     g_host             = nullptr;
     g_selfId           = 0U;
 }

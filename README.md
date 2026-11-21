@@ -1,6 +1,6 @@
 # `rng_fatalis` 官方插件技术文档（黑龙一阶段二足纯 RNG 出招控制）
 
-- **插件标识**：`fatalis`（编译产物 `rng_fatalis.dll`，版本 `1.0.0`）
+- **插件标识**：`fatalis`（编译产物 `rng_fatalis.dll`，版本 `1.0.1`）
 - **源码位置**：[fatalis_plugin.cpp](fatalis_plugin.cpp)
 - **宿主依赖**：`mhw_rng.dll`（Plugin SDK `kMhwRngApiVersion == 2`，头文件 [mhw_rng_api.h](include/mhw_rng_api.h)）
 - **接管调用点**：`RVA 0x1339C8C`（`cThinkMgr::updateThk` @ `0x141339640` 内唯一的 `CALL MtRandom::nrand`）
@@ -24,8 +24,9 @@
 
 1. **调用方栈帧解析（`slotPtr = ctx->returnAddrSlot`）**：
    - `updateThk` 序言压栈 3 个非易失寄存器并开辟 `0x80` 字节栈帧，因此调用方返回地址固定位于 `slotPtr[20]`。
-   - 游戏内 `cThinkMgr::updateThk` 仅有两个调用方：
-     - **`0x133B6F0`（`FUN_14133b640`，主 AI 帧更新）**：`cThinkEm* = slotPtr[19]`（保存的 `RDI`），`cThinkMgr* = thinkEm + 0x20`，`Monster* = slotPtr[21]`（保存的 `RBX`）。
+   - 游戏内 `cThinkMgr::updateThk` 共有三处调用方：
+     - **`0x132B83D`（`cThinkEm::update` @ `0x14132B7B0`，大型怪物主 AI 帧更新）**：`cThinkEm* = slotPtr[23]`（保存的 `RSI`），`cThinkMgr* = thinkEm + 0x20`，`Monster* = slotPtr[19]`（保存的 `RDI`）。
+     - **`0x133B6F0`（`FUN_14133b640`，次级 AI 帧更新）**：`cThinkEm* = slotPtr[19]`（保存的 `RDI`），`cThinkMgr* = thinkEm + 0x20`，`Monster* = slotPtr[21]`（保存的 `RBX`）。
      - **`0x133A876`（`FUN_14133a850`，预取周期）**：`cThinkMgr* = slotPtr[21]`，`Monster* = *(cThinkMgr + 0x508)`（兜底从 `thinkEm + 0x08` 读取）。
 2. **`cThinkMgr` 实时字段与候选表布局**：
    - `mgr + 0x00`：`cThinkMgr::vft` 虚表指针（固定 `exeBase + 0x324F438`），用于指针合法性校验。
@@ -64,6 +65,7 @@
 | `$rng fatalis` 或 `$rng fatalis status` | 查看当前开关、`>4500` 火球模式、P1 守卫开关及最近一次命中记录 |
 | `$rng fatalis on` / `off` | 开启或关闭黑龙一阶段二足纯 RNG 控招（`on` 时若总接管未开启会自动开启） |
 | `$rng fatalis history` | 显示最近最多 8 条受控抽签日志（距离方位段、节点下标、分枝权重与注入 `u32`） |
+| `$rng fatalis diag` | 显示回调次数、非黑龙计数、调用方 RVA 校验与最近一次未命中节点信息（调试用） |
 | `$rng fatalis far single` / `far multi` | 切换 `>4500` 极远距离目标：单发火球（`55:179`）或三连火球（`55:220`） |
 | `$rng fatalis guards on` / `off` | 开关辅助守卫（倒地派生 `129..133`、遮挡 `46`、额外龙车 `18`、二/四足切换 `14/15`） |
 | `$rng fatalis help` | 在游戏聊天框查看简要参数帮助 |
