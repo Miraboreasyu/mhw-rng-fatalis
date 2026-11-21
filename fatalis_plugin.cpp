@@ -42,6 +42,8 @@ constexpr std::uintptr_t kOffMonsterId           = 0x12280U;
 constexpr std::uintptr_t kOffThinkEmToMgr        = 0x20U;
 constexpr std::uintptr_t kOffThinkEmMonster      = 0x08U;
 constexpr std::uintptr_t kOffMgrCandidates       = 0x40U;      // `ThkCandidate[30]` (`{ int32_t segIdx; float weight; }`)
+constexpr std::uintptr_t kOffMgrFrame0JumpStack  = 0x200U;     // `20 * 0x10` (`{ uintptr_t nodeBase; uint64_t segIdx; }`)
+constexpr std::uintptr_t kOffMgrFrame0JumpCount  = 0x340U;     // `int32_t` return stack count (0..20)
 constexpr std::uintptr_t kOffMgrFrameBase        = 0x180U;     // Stack frame stride (`d * 0x180`)
 constexpr std::uintptr_t kOffMgrNodeBase         = 0x350U;     // `frameBase + 0x350`: `THKSegment*`
 constexpr std::uintptr_t kOffMgrThkFileIdx       = 0x35CU;     // `frameBase + 0x35C`: `int32_t` (0 = `_00`, 55 = `_55`)
@@ -51,6 +53,7 @@ constexpr std::uintptr_t kOffMgrMonster          = 0x508U;     // `Monster*` cac
 constexpr std::uintptr_t kThkSegStride           = 0x80U;      // 128 bytes per `THKSegment`
 constexpr std::size_t    kMaxThkCandidates       = 30U;
 constexpr std::size_t    kMaxSegmentsPerNode     = 256U;
+constexpr std::int32_t   kVanillaEm013NodeCount  = 223;
 
 // Open float interval `(0.0f, 1.0f)` bounds for `cThinkMgr::updateThk` (`acc <= roll && roll < acc + weight[k]`):
 constexpr std::uint32_t  kMinSafeFloatU32        = 0x00000001U;
@@ -132,6 +135,8 @@ struct DiagSnapshot {
     std::int32_t  lastUnmatchNode   = -1;
     std::int32_t  lastUnmatchSeg0   = -1;
     std::int32_t  lastUnmatchCaller = -1;
+    std::int32_t  lastUnmatchTFile  = -1;
+    std::int32_t  lastUnmatchTNode  = -1;
 };
 
 constexpr std::size_t kHistoryCap = 8U;
@@ -187,6 +192,18 @@ void CopyTrunc(char* dst, std::size_t cap, const char* src) noexcept {
 // ============================================================================
 //  SEH-Safe Live THK Context Extraction from `cThinkMgr::updateThk`
 // ============================================================================
+
+// Locate node END sentinel (`seg[0] & 1`) to recover exact `nodeArrIdx` (`endVal - 10000`)
+std::int32_t ResolveNodeArrIdx(std::uintptr_t nodeBase) noexcept {
+    if (!IsValidUserPtr(nodeBase)) return -1;
+    for (std::size_t s = 0U; s < kMaxSegmentsPerNode; ++s) {
+        const std::uintptr_t segAddr = nodeBase + s * kThkSegStride;
+        if ((*reinterpret_cast<const std::uint8_t*>(segAddr) & 0x01U) != 0U) {
+            return *reinterpret_cast<const std::int32_t*>(segAddr + 0x24U) - 10000;
+        }
+    }
+    return -1;
+}
 
 bool ReadLiveThkContextSEH(const MhwRngDrawContext* ctx, LiveThkContext& out) noexcept {
     if (!ctx || !ctx->returnAddrSlot || !ctx->exeBase) {
@@ -258,18 +275,26 @@ bool ReadLiveThkContextSEH(const MhwRngDrawContext* ctx, LiveThkContext& out) no
 
         out.thkFileIdx = *reinterpret_cast<const std::int32_t*>(frameBase + kOffMgrThkFileIdx);
         if (depth == 1U) {
-            out.callerNodeIdx = *reinterpret_cast<const std::int32_t*>(mgr + kOffMgrCallerNodeIdx);
+            std::int32_t callerIdx = *reinterpret_cast<const std::int32_t*>(mgr + kOffMgrCallerNodeIdx);
+            if (callerIdx >= kVanillaEm013NodeCount) {
+                // Unwind Frame 0 local jump return stack (`mgr + 0x200`) when instrumented THK uses wrapper nodes
+                const std::int32_t jCnt = *reinterpret_cast<const std::int32_t*>(mgr + kOffMgrFrame0JumpCount);
+                if (jCnt >= 2 && jCnt <= 20) {
+                    for (std::int32_t k = jCnt - 2; k >= 0; --k) {
+                        const std::uintptr_t parentBase = *reinterpret_cast<const std::uintptr_t*>(
+                            mgr + kOffMgrFrame0JumpStack + static_cast<std::uintptr_t>(k) * 0x10U);
+                        const std::int32_t pIdx = ResolveNodeArrIdx(parentBase);
+                        if (pIdx >= 0 && pIdx < kVanillaEm013NodeCount) {
+                            callerIdx = pIdx;
+                            break;
+                        }
+                    }
+                }
+            }
+            out.callerNodeIdx = callerIdx;
         }
 
-        // Locate node END sentinel (`seg[0] & 1`) to recover exact `nodeArrIdx` (`endVal - 10000`)
-        std::int32_t resolvedArrIdx = -1;
-        for (std::size_t s = 0U; s < kMaxSegmentsPerNode; ++s) {
-            const std::uintptr_t segAddr = nodeBase + s * kThkSegStride;
-            if ((*reinterpret_cast<const std::uint8_t*>(segAddr) & 0x01U) != 0U) {
-                resolvedArrIdx = *reinterpret_cast<const std::int32_t*>(segAddr + 0x24U) - 10000;
-                break;
-            }
-        }
+        const std::int32_t resolvedArrIdx = ResolveNodeArrIdx(nodeBase);
         if (resolvedArrIdx < 0) {
             out.failReason = ReadFailReason::kBadDepthOrNode;
             return false;
@@ -292,11 +317,30 @@ bool ReadLiveThkContextSEH(const MhwRngDrawContext* ctx, LiveThkContext& out) no
 
             const std::uintptr_t seg = nodeBase + static_cast<std::uintptr_t>(cands[i].segIdx) * kThkSegStride;
             SegmentOption& dst = out.cands[n++];
-            dst.segIdx        = cands[i].segIdx;
-            dst.weight        = w;
-            dst.ctrlFlags     = *reinterpret_cast<const std::uint32_t*>(seg + 0x00U);
-            dst.targetThkFile = *reinterpret_cast<const std::int32_t*>(seg + 0x28U);
-            dst.targetNodeId  = *reinterpret_cast<const std::int32_t*>(seg + 0x2CU);
+            dst.segIdx    = cands[i].segIdx;
+            dst.weight    = w;
+            dst.ctrlFlags = *reinterpret_cast<const std::uint32_t*>(seg + 0x00U);
+
+            std::int32_t tf = *reinterpret_cast<const std::int32_t*>(seg + 0x28U);
+            std::int32_t tn = *reinterpret_cast<const std::int32_t*>(seg + 0x2CU);
+            if (tf < 0) {
+                // Follow 1-hop local wrapper nodes (`seg + 0x30` -> trampoline node containing `file=55, node=ID`)
+                const std::uintptr_t locPtr = *reinterpret_cast<const std::uintptr_t*>(seg + 0x30U);
+                if (IsValidUserPtr(locPtr)) {
+                    for (std::size_t ws = 0U; ws < 8U; ++ws) {
+                        const std::uintptr_t wseg = locPtr + ws * kThkSegStride;
+                        if ((*reinterpret_cast<const std::uint8_t*>(wseg) & 0x01U) != 0U) break;
+                        const std::int32_t wtf = *reinterpret_cast<const std::int32_t*>(wseg + 0x28U);
+                        if (wtf >= 0) {
+                            tf = wtf;
+                            tn = *reinterpret_cast<const std::int32_t*>(wseg + 0x2CU);
+                            break;
+                        }
+                    }
+                }
+            }
+            dst.targetThkFile = tf;
+            dst.targetNodeId  = tn;
             sumW += w;
         }
 
@@ -593,6 +637,8 @@ void __fastcall OnThkRandomDraw(const MhwRngDrawContext* ctx,
         g_diag.lastUnmatchNode   = lc.nodeArrIdx;
         g_diag.lastUnmatchSeg0   = (lc.candCount > 0U) ? lc.cands[0].segIdx : -1;
         g_diag.lastUnmatchCaller = lc.callerNodeIdx;
+        g_diag.lastUnmatchTFile  = (lc.candCount > 0U) ? lc.cands[0].targetThkFile : -1;
+        g_diag.lastUnmatchTNode  = (lc.candCount > 0U) ? lc.cands[0].targetNodeId : -1;
         return;
     }
 
@@ -690,10 +736,11 @@ void PrintFatalisDiag() {
                        ds.lastBadCallerRva,
                        static_cast<unsigned long long>(ds.badVftOrPtrCount));
     if (ds.fatalisUnmatched > 0ULL) {
-        g_host->ChatPrintf(u8"[fatalis] 黑龙未命中(P2/P3/四足/非P1节点)=%llu次, 最近一次(d=%u file=%d node=%d seg0=%d caller=%d)",
+        g_host->ChatPrintf(u8"[fatalis] 黑龙未命中=%llu次, 最近(d=%u file=%d node=%d seg0=%d caller=%d tgt0=%d:%d)",
                            static_cast<unsigned long long>(ds.fatalisUnmatched),
                            ds.lastUnmatchDepth, ds.lastUnmatchFile,
-                           ds.lastUnmatchNode, ds.lastUnmatchSeg0, ds.lastUnmatchCaller);
+                           ds.lastUnmatchNode, ds.lastUnmatchSeg0, ds.lastUnmatchCaller,
+                           ds.lastUnmatchTFile, ds.lastUnmatchTNode);
     }
 }
 
@@ -855,7 +902,7 @@ const MhwRngPluginDescriptor kPluginDesc = {
     kMhwRngApiVersion,
     "fatalis",
     u8"黑龙一阶段二足纯RNG出招控制插件",
-    "1.0.1",
+    "1.0.2",
     u8"仅通过mhw_rng抽签回调控制黑龙(MonsterID=101)一阶段二足全距离段出招"
 };
 

@@ -1,6 +1,6 @@
 # `rng_fatalis` 官方插件技术文档（黑龙一阶段二足纯 RNG 出招控制）
 
-- **插件标识**：`fatalis`（编译产物 `rng_fatalis.dll`，版本 `1.0.1`）
+- **插件标识**：`fatalis`（编译产物 `rng_fatalis.dll`，版本 `1.0.2`）
 - **源码位置**：[fatalis_plugin.cpp](fatalis_plugin.cpp)
 - **宿主依赖**：`mhw_rng.dll`（Plugin SDK `kMhwRngApiVersion == 2`，头文件 [mhw_rng_api.h](include/mhw_rng_api.h)）
 - **接管调用点**：`RVA 0x1339C8C`（`cThinkMgr::updateThk` @ `0x141339640` 内唯一的 `CALL MtRandom::nrand`）
@@ -39,6 +39,7 @@
 3. **节点数组下标定位与原版浮点反算**：
    - 从 `nodeBase` 起按 `0x80` 步长向前扫描至 `seg[0] & 1` 的结束标记段，其 `+0x24` 偏移存储 `10000 + nodeArrIdx`。
    - 原版在 `0x141339C8C` 处按 `roll = (float)u * (100.0f / 2^32) * (totalWeight * 0.01f)` 命中首个满足 `acc <= roll && roll < acc + weight[k]` 的候选分枝。
+   - **局部封装节点与调用栈解绕**：当环境加载了带探针包装的 THK（如 `FatalisAdaptive`）时，候选分枝可能先通过 `seg + 0x30` 局部跳转至 4 段封装节点再调用 `file=55, node=ID`。插件读取候选分枝时会自动沿 `seg + 0x30` 向下追踪 1 跳解析出真实 `(file, node)`；当 `depth == 1` 且 `callerNodeIdx >= 223` 时，会进一步读取 Frame 0 局部跳转返回栈（`mgr + 0x200`，深度 `mgr + 0x340`）还原外层真实一阶段节点编号。
    - 插件选取目标候选分枝 `k` 后，计算区间中点比例 `frac = (cumBefore + 0.5 * weight[k]) / totalWeight`，并映射至 `[0x00000001U, 0xFFFFFF00U]`，保证对非零权重分支的命中率为 100%。
 
 ---
